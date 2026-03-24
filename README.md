@@ -19,6 +19,7 @@
 - 不依赖文件系统监控、线程库、容器库
 - 上层负责提供已经切好的视频访问单元和音频帧
 - 上层负责提供 `PTS/DTS`，单位固定为 `90kHz`
+- 可通过回调获知 `.ts` 和 `m3u8` 已更新，便于上层执行上传/分发
 
 ## 核心接口
 
@@ -29,6 +30,18 @@
 1. `hls_muxer_open()`
 2. 连续调用 `hls_muxer_input_video()` / `hls_muxer_input_audio()`
 3. `hls_muxer_close()`
+
+如需在文件更新后通知上层，可在 `hls_muxer_config_t` 中填写：
+
+- `on_event`
+- `event_opaque`
+
+当前会触发两类事件：
+
+- `HLS_MUXER_EVENT_SEGMENT_READY`：一个 `.ts` 已经关闭并可读取
+- `HLS_MUXER_EVENT_PLAYLIST_UPDATED`：`m3u8` 已重写完成
+
+触发顺序是先 `.ts`，后 `m3u8`，这样上层在收到 playlist 更新通知时，相关 segment 已可上传。
 
 ## 视频切片策略
 
@@ -73,6 +86,26 @@ ctest --test-dir build --output-on-failure
 ```
 
 当前包含一个集成测试：使用仓库内硬编码的 H.264 IDR AU 和 AAC ADTS 帧，验证 `m3u8` 与 `.ts` 分片是否按预期生成。
+
+## H.265 + AAC 一键验证
+
+仓库内保存了一份本地生成的样本：
+
+- `testdata/h265_aac/sample_h265.hevc`
+- `testdata/h265_aac/sample_aac.aac`
+
+一键执行验证：
+
+```sh
+./scripts/verify_saved_h265_aac.sh
+```
+
+这个命令会：
+
+- 构建 `offline_mux`
+- 用保存好的 H.265 Annex-B 和 AAC ADTS 样本生成 HLS
+- 用 `ffprobe` 检查 `m3u8`
+- 用 `ffmpeg` 完整解复用和解码，确认输出有效
 
 ## 示例
 

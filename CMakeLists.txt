@@ -30,6 +30,15 @@ target_link_libraries(demo
         hls_muxer
 )
 
+add_executable(offline_mux
+    examples/offline_mux_main.c
+)
+
+target_link_libraries(offline_mux
+    PRIVATE
+        hls_muxer
+)
+
 add_executable(hls_muxer_integration_test
     tests/hls_muxer_integration_test.c
 )

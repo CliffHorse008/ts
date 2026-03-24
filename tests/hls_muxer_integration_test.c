@@ -13,6 +13,17 @@
 #define TS_PACKET_SIZE 188
 #define TEST_H264_AU_SIZE 320
 #define TEST_AAC_FRAME_SIZE 127
+#define TEST_MAX_EVENTS 16
+
+typedef struct {
+    hls_muxer_event_type_t event;
+    char path[512];
+} event_record_t;
+
+typedef struct {
+    event_record_t items[TEST_MAX_EVENTS];
+    size_t count;
+} event_log_t;
 
 static void build_test_h264_idr_au(uint8_t *buf, size_t size)
 {
@@ -210,12 +221,74 @@ static int segment_has_sync_packets(const char *segment_path)
     return 1;
 }
 
+static void test_event_cb(void *opaque,
+                          hls_muxer_event_type_t event,
+                          const char *path)
+{
+    event_log_t *log = (event_log_t *)opaque;
+
+    if (log == NULL || path == NULL || log->count >= TEST_MAX_EVENTS) {
+        return;
+    }
+
+    log->items[log->count].event = event;
+    snprintf(log->items[log->count].path, sizeof(log->items[log->count].path), "%s", path);
+    log->count += 1;
+}
+
+static int event_log_matches(const event_log_t *log, const char *output_dir)
+{
+    char playlist_path[512];
+    char segment_path[512];
+    size_t i;
+
+    if (log == NULL) {
+        return 0;
+    }
+
+    if (snprintf(playlist_path, sizeof(playlist_path), "%s/live.m3u8", output_dir) >= (int)sizeof(playlist_path)) {
+        return 0;
+    }
+
+    if (log->count != 7) {
+        fprintf(stderr, "unexpected event count: %zu\n", log->count);
+        return 0;
+    }
+
+    if (log->items[0].event != HLS_MUXER_EVENT_PLAYLIST_UPDATED ||
+        strcmp(log->items[0].path, playlist_path) != 0) {
+        fprintf(stderr, "unexpected initial playlist event\n");
+        return 0;
+    }
+
+    for (i = 0; i < 3; ++i) {
+        if (snprintf(segment_path, sizeof(segment_path), "%s/seg_%05zu.ts", output_dir, i) >= (int)sizeof(segment_path)) {
+            return 0;
+        }
+
+        if (log->items[1 + i * 2].event != HLS_MUXER_EVENT_SEGMENT_READY ||
+            strcmp(log->items[1 + i * 2].path, segment_path) != 0) {
+            fprintf(stderr, "unexpected segment event at index %zu\n", 1 + i * 2);
+            return 0;
+        }
+
+        if (log->items[2 + i * 2].event != HLS_MUXER_EVENT_PLAYLIST_UPDATED ||
+            strcmp(log->items[2 + i * 2].path, playlist_path) != 0) {
+            fprintf(stderr, "unexpected playlist event at index %zu\n", 2 + i * 2);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 static int run_muxer_smoke_test(const char *output_dir)
 {
     char playlist_path[512];
     char segment_path[512];
     hls_muxer_t *muxer = NULL;
     hls_muxer_config_t cfg;
+    event_log_t event_log;
     hls_adts_info_t adts_info;
     uint8_t h264_idr_au[TEST_H264_AU_SIZE];
     uint8_t aac_adts_frame[TEST_AAC_FRAME_SIZE];
@@ -224,6 +297,7 @@ static int run_muxer_smoke_test(const char *output_dir)
 
     build_test_h264_idr_au(h264_idr_au, sizeof(h264_idr_au));
     build_test_aac_adts_frame(aac_adts_frame, sizeof(aac_adts_frame));
+    memset(&event_log, 0, sizeof(event_log));
 
     if (!hls_detect_h264_idr(h264_idr_au, sizeof(h264_idr_au))) {
         fprintf(stderr, "hardcoded H.264 access unit was not detected as IDR\n");
@@ -254,6 +328,8 @@ static int run_muxer_smoke_test(const char *output_dir)
     cfg.playlist_length = 6;
     cfg.video_codec = HLS_VIDEO_CODEC_H264;
     cfg.audio_codec = HLS_AUDIO_CODEC_AAC;
+    cfg.on_event = test_event_cb;
+    cfg.event_opaque = &event_log;
 
     if (hls_muxer_open(&muxer, &cfg) != HLS_OK) {
         fprintf(stderr, "hls_muxer_open failed\n");
@@ -292,6 +368,10 @@ static int run_muxer_smoke_test(const char *output_dir)
     }
 
     if (!playlist_contains_expected_entries(playlist_path)) {
+        return 1;
+    }
+
+    if (!event_log_matches(&event_log, output_dir)) {
         return 1;
     }
 

@@ -17,6 +17,16 @@
 #define HLS_AUDIO_PID 0x0101
 #define HLS_PCR_PID HLS_VIDEO_PID
 
+#ifndef HLS_MUXER_DEBUG_LOG
+#define HLS_MUXER_DEBUG_LOG 1
+#endif
+
+#if HLS_MUXER_DEBUG_LOG
+#define HLS_DEBUGF(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define HLS_DEBUGF(...) ((void)0)
+#endif
+
 typedef struct {
     char file_name[128];
     double duration_sec;
@@ -42,6 +52,7 @@ struct hls_muxer {
     uint32_t segment_sequence;
     uint32_t media_sequence;
     int has_open_segment;
+    int started_streaming;
     int saw_video;
     int saw_audio;
     int got_first_pts;
@@ -95,12 +106,13 @@ static uint32_t hls_crc32_mpeg(const uint8_t *data, size_t size)
 static void hls_write_pts(uint8_t *dst, uint8_t fb, uint64_t pts90k)
 {
     uint64_t v = pts90k & 0x1ffffffffULL;
+    uint64_t fb_bits = (((uint64_t)fb) & 0x0fULL) << 4;
 
-    dst[0] = (uint8_t)((fb << 4) | (((v >> 30) & 0x07) << 1) | 1);
+    dst[0] = (uint8_t)(fb_bits | (((v >> 30) & 0x07ULL) << 1) | 1ULL);
     dst[1] = (uint8_t)(v >> 22);
-    dst[2] = (uint8_t)((((v >> 15) & 0x7f) << 1) | 1);
+    dst[2] = (uint8_t)((((v >> 15) & 0x7fULL) << 1) | 1ULL);
     dst[3] = (uint8_t)(v >> 7);
-    dst[4] = (uint8_t)((((v >> 0) & 0x7f) << 1) | 1);
+    dst[4] = (uint8_t)((((v >> 0) & 0x7fULL) << 1) | 1ULL);
 }
 
 static void hls_write_pcr(uint8_t *dst, uint64_t pcr90k)
@@ -180,6 +192,15 @@ static int hls_write_audio_descriptor(uint8_t *dst, hls_audio_codec_t codec)
     return 0;
 }
 
+static void hls_notify_event(hls_muxer_t *m,
+                             hls_muxer_event_type_t event,
+                             const char *path)
+{
+    if (m->cfg.on_event != NULL && path != NULL) {
+        m->cfg.on_event(m->cfg.event_opaque, event, path);
+    }
+}
+
 static hls_result_t hls_playlist_write(hls_muxer_t *m, int end_list)
 {
     FILE *fp;
@@ -213,6 +234,7 @@ static hls_result_t hls_playlist_write(hls_muxer_t *m, int end_list)
     }
 
     fclose(fp);
+    hls_notify_event(m, HLS_MUXER_EVENT_PLAYLIST_UPDATED, m->playlist_path);
     return HLS_OK;
 }
 
@@ -275,6 +297,8 @@ static hls_result_t hls_close_segment(hls_muxer_t *m, int end_list)
         m->segment_fp = NULL;
     }
 
+    hls_notify_event(m, HLS_MUXER_EVENT_SEGMENT_READY, m->segment_path);
+
     duration_sec = (double)(m->current_segment_max_pts90k - m->segment_start_pts90k) / 90000.0;
     if (duration_sec <= 0.0) {
         duration_sec = (double)m->cfg.target_duration_sec;
@@ -291,7 +315,7 @@ static void hls_write_pat(hls_muxer_t *m)
     uint8_t pkt[TS_PACKET_SIZE];
     uint8_t sec[1024];
     uint32_t crc;
-    int sec_len;
+    size_t sec_len;
 
     memset(pkt, 0xff, sizeof(pkt));
     memset(sec, 0, sizeof(sec));
@@ -401,10 +425,17 @@ static hls_result_t hls_rotate_if_needed(hls_muxer_t *m, uint64_t pts90k, int ke
     hls_result_t rc;
 
     if (!m->has_open_segment) {
+        if (!m->started_streaming &&
+            m->cfg.video_codec != HLS_VIDEO_CODEC_NONE &&
+            !keyframe) {
+            return HLS_OK;
+        }
+
         rc = hls_open_segment(m, pts90k);
         if (rc != HLS_OK) {
             return rc;
         }
+        m->started_streaming = 1;
         hls_write_tables(m);
         return HLS_OK;
     }
@@ -451,12 +482,16 @@ static hls_result_t hls_write_ts_payload(hls_muxer_t *m,
         pkt[2] = (uint8_t)(pid & 0xff);
 
         if (insert_pcr && off == 0) {
-            max_payload -= 8;
+            size_t stuffing = remain < 176 ? 176 - remain : 0;
+
             pkt[3] = 0x30 | (*cc & 0x0f);
-            pkt[4] = 7;
+            pkt[4] = (uint8_t)(7 + stuffing);
             pkt[5] = 0x10;
             hls_write_pcr(&pkt[6], pcr90k);
-            idx = 12;
+            if (stuffing > 0) {
+                memset(&pkt[12], 0xff, stuffing);
+            }
+            idx = 12 + stuffing;
         } else if (remain < 184) {
             size_t stuffing = 184 - remain;
             if (stuffing == 1) {
@@ -488,6 +523,27 @@ static hls_result_t hls_write_ts_payload(hls_muxer_t *m,
         copy_len = remain < max_payload ? remain : max_payload;
         if (copy_len > 0) {
             memcpy(&pkt[idx], &payload[off], copy_len);
+        }
+
+        if (off == 0) {
+            uint8_t b0 = copy_len > 0 ? payload[0] : 0;
+            uint8_t b1 = copy_len > 1 ? payload[1] : 0;
+            uint8_t b2 = copy_len > 2 ? payload[2] : 0;
+            uint8_t b3 = copy_len > 3 ? payload[3] : 0;
+
+            HLS_DEBUGF("[hls] ts pid=0x%04x cc=%u start=%d insert_pcr=%d payload_len=%zu remain=%zu idx=%zu copy_len=%zu bytes=%02x %02x %02x %02x\n",
+                       (unsigned int)pid,
+                       (unsigned int)(*cc & 0x0f),
+                       payload_start,
+                       insert_pcr,
+                       payload_len,
+                       remain,
+                       idx,
+                       copy_len,
+                       (unsigned int)b0,
+                       (unsigned int)b1,
+                       (unsigned int)b2,
+                       (unsigned int)b3);
         }
 
         fwrite(pkt, 1, sizeof(pkt), m->segment_fp);
@@ -543,6 +599,24 @@ static hls_result_t hls_write_pes(hls_muxer_t *m,
         hls_write_pts(&hdr[hdr_len], 0x01, dts90k);
         hdr_len += 5;
     }
+
+    HLS_DEBUGF("[hls] pes pid=0x%04x sid=0x%02x es_size=%zu hdr_len=%zu pts=%llu dts=%llu write_dts=%d write_pcr=%d hdr=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+               (unsigned int)pid,
+               (unsigned int)stream_id,
+               es_size,
+               hdr_len,
+               (unsigned long long)pts90k,
+               (unsigned long long)dts90k,
+               write_dts,
+               write_pcr,
+               (unsigned int)hdr[0],
+               (unsigned int)hdr[1],
+               (unsigned int)hdr[2],
+               (unsigned int)hdr[3],
+               (unsigned int)hdr[4],
+               (unsigned int)hdr[5],
+               (unsigned int)hdr[6],
+               (unsigned int)hdr[7]);
 
     rc = hls_write_ts_payload(m, pid, cc, hdr, hdr_len, 1, write_pcr, dts90k);
     if (rc != HLS_OK) {
@@ -736,11 +810,6 @@ hls_result_t hls_muxer_input_video(hls_muxer_t *m,
         return HLS_ERR_ARG;
     }
 
-    if (!m->got_first_pts) {
-        m->first_pts90k = pts90k;
-        m->got_first_pts = 1;
-    }
-
     if (keyframe < 0) {
         if (m->cfg.video_codec == HLS_VIDEO_CODEC_H264) {
             keyframe = hls_detect_h264_idr(data, size);
@@ -751,10 +820,30 @@ hls_result_t hls_muxer_input_video(hls_muxer_t *m,
         }
     }
 
+    if (!m->started_streaming && !keyframe) {
+        HLS_DEBUGF("[hls] drop video before first keyframe size=%zu pts=%llu dts=%llu\n",
+                   size,
+                   (unsigned long long)pts90k,
+                   (unsigned long long)dts90k);
+        return HLS_OK;
+    }
+
     rc = hls_rotate_if_needed(m, pts90k, keyframe);
     if (rc != HLS_OK) {
         return rc;
     }
+
+    if (!m->got_first_pts) {
+        m->first_pts90k = pts90k;
+        m->got_first_pts = 1;
+    }
+
+    HLS_DEBUGF("[hls] input video size=%zu pts=%llu dts=%llu keyframe=%d cc=%u\n",
+               size,
+               (unsigned long long)pts90k,
+               (unsigned long long)dts90k,
+               keyframe,
+               (unsigned int)(m->cc_video & 0x0f));
 
     rc = hls_write_pes(m,
                        HLS_VIDEO_PID,
@@ -789,15 +878,27 @@ hls_result_t hls_muxer_input_audio(hls_muxer_t *m,
         return HLS_ERR_ARG;
     }
 
-    if (!m->got_first_pts) {
-        m->first_pts90k = pts90k;
-        m->got_first_pts = 1;
+    if (!m->started_streaming && m->cfg.video_codec != HLS_VIDEO_CODEC_NONE) {
+        HLS_DEBUGF("[hls] drop audio before first keyframe size=%zu pts=%llu\n",
+                   size,
+                   (unsigned long long)pts90k);
+        return HLS_OK;
     }
 
     rc = hls_rotate_if_needed(m, pts90k, m->cfg.video_codec == HLS_VIDEO_CODEC_NONE);
     if (rc != HLS_OK) {
         return rc;
     }
+
+    if (!m->got_first_pts) {
+        m->first_pts90k = pts90k;
+        m->got_first_pts = 1;
+    }
+
+    HLS_DEBUGF("[hls] input audio size=%zu pts=%llu cc=%u\n",
+               size,
+               (unsigned long long)pts90k,
+               (unsigned int)(m->cc_audio & 0x0f));
 
     rc = hls_write_pes(m,
                        HLS_AUDIO_PID,

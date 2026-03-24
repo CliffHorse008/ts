@@ -39,6 +39,15 @@ typedef struct {
     int frame_length;
 } hls_adts_info_t;
 
+typedef enum {
+    HLS_MUXER_EVENT_SEGMENT_READY = 0,
+    HLS_MUXER_EVENT_PLAYLIST_UPDATED = 1
+} hls_muxer_event_type_t;
+
+typedef void (*hls_muxer_event_cb)(void *opaque,
+                                   hls_muxer_event_type_t event,
+                                   const char *path);
+
 typedef struct {
     const char *output_dir;
     const char *playlist_name;
@@ -47,6 +56,8 @@ typedef struct {
     uint32_t playlist_length;
     hls_video_codec_t video_codec;
     hls_audio_codec_t audio_codec;
+    hls_muxer_event_cb on_event;
+    void *event_opaque;
 } hls_muxer_config_t;
 
 typedef struct hls_muxer hls_muxer_t;
