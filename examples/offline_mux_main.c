@@ -405,6 +405,7 @@ int main(int argc, char **argv)
     cfg.playlist_length = 6;
     cfg.video_codec = (hls_video_codec_t)video_codec;
     cfg.audio_codec = HLS_AUDIO_CODEC_AAC;
+    cfg.debug_write_files = 1;
 
     if (hls_muxer_open(&muxer, &cfg) != HLS_OK) {
         fprintf(stderr, "hls_muxer_open failed\n");

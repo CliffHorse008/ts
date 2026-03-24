@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 
 #define TS_PACKET_SIZE 188
@@ -33,12 +34,22 @@ typedef struct {
     uint32_t sequence;
 } hls_segment_info_t;
 
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+} hls_buffer_t;
+
 struct hls_muxer {
     hls_muxer_config_t cfg;
-    FILE *segment_fp;
-    FILE *playlist_fp;
     char playlist_path[HLS_MAX_PATH];
     char segment_path[HLS_MAX_PATH];
+    char current_segment_name[128];
+    char ready_segment_name[128];
+
+    hls_buffer_t current_segment_buf;
+    hls_buffer_t ready_segment_buf;
+    hls_buffer_t playlist_buf;
 
     uint8_t cc_pat;
     uint8_t cc_pmt;
@@ -192,25 +203,165 @@ static int hls_write_audio_descriptor(uint8_t *dst, hls_audio_codec_t codec)
     return 0;
 }
 
+static void hls_buffer_reset(hls_buffer_t *buf)
+{
+    if (buf != NULL) {
+        buf->size = 0;
+    }
+}
+
+static void hls_buffer_free(hls_buffer_t *buf)
+{
+    if (buf == NULL) {
+        return;
+    }
+
+    free(buf->data);
+    memset(buf, 0, sizeof(*buf));
+}
+
+static hls_result_t hls_buffer_reserve(hls_buffer_t *buf, size_t needed)
+{
+    uint8_t *new_mem;
+    size_t new_capacity;
+
+    if (buf == NULL) {
+        return HLS_ERR_ARG;
+    }
+
+    if (needed <= buf->capacity) {
+        return HLS_OK;
+    }
+
+    new_capacity = buf->capacity == 0 ? 1024 : buf->capacity;
+    while (new_capacity < needed) {
+        if (new_capacity > ((size_t)-1) / 2) {
+            return HLS_ERR_IO;
+        }
+        new_capacity *= 2;
+    }
+
+    new_mem = (uint8_t *)realloc(buf->data, new_capacity);
+    if (new_mem == NULL) {
+        return HLS_ERR_IO;
+    }
+
+    buf->data = new_mem;
+    buf->capacity = new_capacity;
+    return HLS_OK;
+}
+
+static hls_result_t hls_buffer_append(hls_buffer_t *buf, const void *data, size_t size)
+{
+    hls_result_t rc;
+
+    if (buf == NULL || (data == NULL && size != 0)) {
+        return HLS_ERR_ARG;
+    }
+
+    rc = hls_buffer_reserve(buf, buf->size + size);
+    if (rc != HLS_OK) {
+        return rc;
+    }
+
+    if (size > 0) {
+        memcpy(&buf->data[buf->size], data, size);
+        buf->size += size;
+    }
+
+    return HLS_OK;
+}
+
+static hls_result_t hls_buffer_appendf(hls_buffer_t *buf, const char *fmt, ...)
+{
+    va_list ap;
+    va_list ap_copy;
+    int needed;
+    hls_result_t rc;
+
+    if (buf == NULL || fmt == NULL) {
+        return HLS_ERR_ARG;
+    }
+
+    va_start(ap, fmt);
+    va_copy(ap_copy, ap);
+    needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) {
+        va_end(ap_copy);
+        return HLS_ERR_IO;
+    }
+
+    rc = hls_buffer_reserve(buf, buf->size + (size_t)needed + 1);
+    if (rc != HLS_OK) {
+        va_end(ap_copy);
+        return rc;
+    }
+
+    (void)vsnprintf((char *)&buf->data[buf->size], (size_t)needed + 1, fmt, ap_copy);
+    va_end(ap_copy);
+    buf->size += (size_t)needed;
+    return HLS_OK;
+}
+
+static hls_result_t hls_write_file(const char *path, const uint8_t *data, size_t size)
+{
+    FILE *fp;
+
+    if (path == NULL || (data == NULL && size != 0)) {
+        return HLS_ERR_ARG;
+    }
+
+    fp = fopen(path, "wb");
+    if (fp == NULL) {
+        return HLS_ERR_IO;
+    }
+
+    if (size > 0 && fwrite(data, 1, size, fp) != size) {
+        fclose(fp);
+        return HLS_ERR_IO;
+    }
+
+    fclose(fp);
+    return HLS_OK;
+}
+
+static hls_result_t hls_segment_write(hls_muxer_t *m, const void *data, size_t size)
+{
+    if (m == NULL) {
+        return HLS_ERR_ARG;
+    }
+
+    return hls_buffer_append(&m->current_segment_buf, data, size);
+}
+
 static void hls_notify_event(hls_muxer_t *m,
                              hls_muxer_event_type_t event,
-                             const char *path)
+                             const char *name,
+                             const uint8_t *data,
+                             size_t size,
+                             uint32_t sequence)
 {
-    if (m->cfg.on_event != NULL && path != NULL) {
-        m->cfg.on_event(m->cfg.event_opaque, event, path);
+    hls_muxer_event_t evt;
+
+    if (m->cfg.on_event != NULL && name != NULL) {
+        memset(&evt, 0, sizeof(evt));
+        evt.type = event;
+        evt.name = name;
+        evt.data = data;
+        evt.size = size;
+        evt.sequence = sequence;
+        m->cfg.on_event(m->cfg.event_opaque, &evt);
     }
 }
 
 static hls_result_t hls_playlist_write(hls_muxer_t *m, int end_list)
 {
-    FILE *fp;
     uint32_t i;
     uint32_t target = m->cfg.target_duration_sec;
+    hls_result_t rc;
 
-    fp = fopen(m->playlist_path, "wb");
-    if (fp == NULL) {
-        return HLS_ERR_IO;
-    }
+    hls_buffer_reset(&m->playlist_buf);
 
     for (i = 0; i < m->segment_count; ++i) {
         uint32_t dur = (uint32_t)(m->segments[i].duration_sec + 0.999);
@@ -219,40 +370,68 @@ static hls_result_t hls_playlist_write(hls_muxer_t *m, int end_list)
         }
     }
 
-    fprintf(fp, "#EXTM3U\n");
-    fprintf(fp, "#EXT-X-VERSION:3\n");
-    fprintf(fp, "#EXT-X-TARGETDURATION:%u\n", target ? target : 2);
-    fprintf(fp, "#EXT-X-MEDIA-SEQUENCE:%u\n", m->media_sequence);
+    rc = hls_buffer_appendf(&m->playlist_buf, "#EXTM3U\n");
+    if (rc != HLS_OK) {
+        return rc;
+    }
+    rc = hls_buffer_appendf(&m->playlist_buf, "#EXT-X-VERSION:3\n");
+    if (rc != HLS_OK) {
+        return rc;
+    }
+    rc = hls_buffer_appendf(&m->playlist_buf, "#EXT-X-TARGETDURATION:%u\n", target ? target : 2);
+    if (rc != HLS_OK) {
+        return rc;
+    }
+    rc = hls_buffer_appendf(&m->playlist_buf, "#EXT-X-MEDIA-SEQUENCE:%u\n", m->media_sequence);
+    if (rc != HLS_OK) {
+        return rc;
+    }
 
     for (i = 0; i < m->segment_count; ++i) {
-        fprintf(fp, "#EXTINF:%.3f,\n", m->segments[i].duration_sec);
-        fprintf(fp, "%s\n", m->segments[i].file_name);
+        rc = hls_buffer_appendf(&m->playlist_buf, "#EXTINF:%.3f,\n", m->segments[i].duration_sec);
+        if (rc != HLS_OK) {
+            return rc;
+        }
+        rc = hls_buffer_appendf(&m->playlist_buf, "%s\n", m->segments[i].file_name);
+        if (rc != HLS_OK) {
+            return rc;
+        }
     }
 
     if (end_list) {
-        fprintf(fp, "#EXT-X-ENDLIST\n");
+        rc = hls_buffer_appendf(&m->playlist_buf, "#EXT-X-ENDLIST\n");
+        if (rc != HLS_OK) {
+            return rc;
+        }
     }
 
-    fclose(fp);
-    hls_notify_event(m, HLS_MUXER_EVENT_PLAYLIST_UPDATED, m->playlist_path);
+    if (m->cfg.debug_write_files) {
+        rc = hls_write_file(m->playlist_path, m->playlist_buf.data, m->playlist_buf.size);
+        if (rc != HLS_OK) {
+            return rc;
+        }
+    }
+
+    hls_notify_event(m,
+                     HLS_MUXER_EVENT_PLAYLIST_UPDATED,
+                     m->cfg.playlist_name,
+                     m->playlist_buf.data,
+                     m->playlist_buf.size,
+                     m->media_sequence);
     return HLS_OK;
 }
 
 static hls_result_t hls_open_segment(hls_muxer_t *m, uint64_t start_pts90k)
 {
-    if (snprintf(m->segment_path,
-                 sizeof(m->segment_path),
-                 "%s/%s%05u.ts",
-                 m->cfg.output_dir,
+    if (snprintf(m->current_segment_name,
+                 sizeof(m->current_segment_name),
+                 "%s%05u.ts",
                  m->cfg.segment_prefix,
-                 m->segment_sequence) >= (int)sizeof(m->segment_path)) {
+                 m->segment_sequence) >= (int)sizeof(m->current_segment_name)) {
         return HLS_ERR_ARG;
     }
 
-    m->segment_fp = fopen(m->segment_path, "wb");
-    if (m->segment_fp == NULL) {
-        return HLS_ERR_IO;
-    }
+    hls_buffer_reset(&m->current_segment_buf);
 
     m->segment_start_pts90k = start_pts90k;
     m->current_segment_max_pts90k = start_pts90k;
@@ -287,22 +466,45 @@ static void hls_append_segment_info(hls_muxer_t *m, double duration_sec)
 static hls_result_t hls_close_segment(hls_muxer_t *m, int end_list)
 {
     double duration_sec;
+    hls_result_t rc;
+    hls_buffer_t tmp_buf;
 
     if (!m->has_open_segment) {
         return HLS_OK;
     }
 
-    if (m->segment_fp != NULL) {
-        fclose(m->segment_fp);
-        m->segment_fp = NULL;
-    }
-
-    hls_notify_event(m, HLS_MUXER_EVENT_SEGMENT_READY, m->segment_path);
-
     duration_sec = (double)(m->current_segment_max_pts90k - m->segment_start_pts90k) / 90000.0;
     if (duration_sec <= 0.0) {
         duration_sec = (double)m->cfg.target_duration_sec;
     }
+
+    tmp_buf = m->ready_segment_buf;
+    m->ready_segment_buf = m->current_segment_buf;
+    m->current_segment_buf = tmp_buf;
+    hls_buffer_reset(&m->current_segment_buf);
+
+    snprintf(m->ready_segment_name, sizeof(m->ready_segment_name), "%s", m->current_segment_name);
+
+    if (m->cfg.debug_write_files) {
+        if (snprintf(m->segment_path,
+                     sizeof(m->segment_path),
+                     "%s/%s",
+                     m->cfg.output_dir,
+                     m->ready_segment_name) >= (int)sizeof(m->segment_path)) {
+            return HLS_ERR_ARG;
+        }
+        rc = hls_write_file(m->segment_path, m->ready_segment_buf.data, m->ready_segment_buf.size);
+        if (rc != HLS_OK) {
+            return rc;
+        }
+    }
+
+    hls_notify_event(m,
+                     HLS_MUXER_EVENT_SEGMENT_READY,
+                     m->ready_segment_name,
+                     m->ready_segment_buf.data,
+                     m->ready_segment_buf.size,
+                     m->segment_sequence);
 
     hls_append_segment_info(m, duration_sec);
     m->segment_sequence += 1;
@@ -310,7 +512,7 @@ static hls_result_t hls_close_segment(hls_muxer_t *m, int end_list)
     return hls_playlist_write(m, end_list);
 }
 
-static void hls_write_pat(hls_muxer_t *m)
+static hls_result_t hls_write_pat(hls_muxer_t *m)
 {
     uint8_t pkt[TS_PACKET_SIZE];
     uint8_t sec[1024];
@@ -346,10 +548,10 @@ static void hls_write_pat(hls_muxer_t *m)
     pkt[4] = 0x00;
     memcpy(&pkt[5], sec, sec_len);
 
-    fwrite(pkt, 1, sizeof(pkt), m->segment_fp);
+    return hls_segment_write(m, pkt, sizeof(pkt));
 }
 
-static void hls_write_pmt(hls_muxer_t *m)
+static hls_result_t hls_write_pmt(hls_muxer_t *m)
 {
     uint8_t pkt[TS_PACKET_SIZE];
     uint8_t sec[1024];
@@ -410,13 +612,19 @@ static void hls_write_pmt(hls_muxer_t *m)
     pkt[4] = 0x00;
     memcpy(&pkt[5], sec, (size_t)pos);
 
-    fwrite(pkt, 1, sizeof(pkt), m->segment_fp);
+    return hls_segment_write(m, pkt, sizeof(pkt));
 }
 
-static void hls_write_tables(hls_muxer_t *m)
+static hls_result_t hls_write_tables(hls_muxer_t *m)
 {
-    hls_write_pat(m);
-    hls_write_pmt(m);
+    hls_result_t rc;
+
+    rc = hls_write_pat(m);
+    if (rc != HLS_OK) {
+        return rc;
+    }
+
+    return hls_write_pmt(m);
 }
 
 static hls_result_t hls_rotate_if_needed(hls_muxer_t *m, uint64_t pts90k, int keyframe)
@@ -436,8 +644,7 @@ static hls_result_t hls_rotate_if_needed(hls_muxer_t *m, uint64_t pts90k, int ke
             return rc;
         }
         m->started_streaming = 1;
-        hls_write_tables(m);
-        return HLS_OK;
+        return hls_write_tables(m);
     }
 
     elapsed90k = pts90k - m->segment_start_pts90k;
@@ -450,7 +657,10 @@ static hls_result_t hls_rotate_if_needed(hls_muxer_t *m, uint64_t pts90k, int ke
         if (rc != HLS_OK) {
             return rc;
         }
-        hls_write_tables(m);
+        rc = hls_write_tables(m);
+        if (rc != HLS_OK) {
+            return rc;
+        }
     }
 
     return HLS_OK;
@@ -466,6 +676,7 @@ static hls_result_t hls_write_ts_payload(hls_muxer_t *m,
                                          uint64_t pcr90k)
 {
     size_t off = 0;
+    hls_result_t rc;
 
     while (off < payload_len || (payload_len == 0 && off == 0)) {
         uint8_t pkt[TS_PACKET_SIZE];
@@ -546,7 +757,10 @@ static hls_result_t hls_write_ts_payload(hls_muxer_t *m,
                        (unsigned int)b3);
         }
 
-        fwrite(pkt, 1, sizeof(pkt), m->segment_fp);
+        rc = hls_segment_write(m, pkt, sizeof(pkt));
+        if (rc != HLS_OK) {
+            return rc;
+        }
         *cc = (uint8_t)((*cc + 1) & 0x0f);
         off += copy_len;
 
@@ -735,7 +949,7 @@ hls_result_t hls_muxer_open(hls_muxer_t **muxer, const hls_muxer_config_t *confi
 {
     hls_muxer_t *m;
 
-    if (muxer == NULL || config == NULL || config->output_dir == NULL ||
+    if (muxer == NULL || config == NULL ||
         config->playlist_name == NULL || config->segment_prefix == NULL) {
         return HLS_ERR_ARG;
     }
@@ -761,8 +975,13 @@ hls_result_t hls_muxer_open(hls_muxer_t **muxer, const hls_muxer_config_t *confi
         return HLS_ERR_UNSUPPORTED;
     }
 
-    if (hls_mkdir_if_needed(config->output_dir) != 0) {
-        return HLS_ERR_IO;
+    if (config->debug_write_files) {
+        if (config->output_dir == NULL) {
+            return HLS_ERR_ARG;
+        }
+        if (hls_mkdir_if_needed(config->output_dir) != 0) {
+            return HLS_ERR_IO;
+        }
     }
 
     m = (hls_muxer_t *)calloc(1, sizeof(*m));
@@ -774,13 +993,15 @@ hls_result_t hls_muxer_open(hls_muxer_t **muxer, const hls_muxer_config_t *confi
     m->segment_sequence = 0;
     m->media_sequence = 0;
 
-    if (snprintf(m->playlist_path,
-                 sizeof(m->playlist_path),
-                 "%s/%s",
-                 config->output_dir,
-                 config->playlist_name) >= (int)sizeof(m->playlist_path)) {
-        free(m);
-        return HLS_ERR_ARG;
+    if (config->debug_write_files) {
+        if (snprintf(m->playlist_path,
+                     sizeof(m->playlist_path),
+                     "%s/%s",
+                     config->output_dir,
+                     config->playlist_name) >= (int)sizeof(m->playlist_path)) {
+            free(m);
+            return HLS_ERR_ARG;
+        }
     }
 
     *muxer = m;
@@ -794,6 +1015,9 @@ void hls_muxer_close(hls_muxer_t *muxer, int end_list)
     }
 
     (void)hls_close_segment(muxer, end_list);
+    hls_buffer_free(&muxer->current_segment_buf);
+    hls_buffer_free(&muxer->ready_segment_buf);
+    hls_buffer_free(&muxer->playlist_buf);
     free(muxer);
 }
 

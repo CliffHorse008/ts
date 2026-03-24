@@ -82,6 +82,7 @@ int main(int argc, char **argv)
     cfg.playlist_length = 6;
     cfg.video_codec = hls_detect_h265_irap(video, video_size) ? HLS_VIDEO_CODEC_H265 : HLS_VIDEO_CODEC_H264;
     cfg.audio_codec = HLS_AUDIO_CODEC_AAC;
+    cfg.debug_write_files = 1;
 
     if (hls_muxer_open(&muxer, &cfg) != HLS_OK) {
         free(video);

@@ -11,7 +11,8 @@
 - 输入 G711U 原始音频帧
 - MPEG-TS 复用
 - 每隔 2 秒在关键帧处切一片 `.ts`
-- 实时更新直播 `m3u8`
+- 默认在内存中生成 `.ts` / `m3u8`
+- 可选调试落盘，实时更新直播 `m3u8`
 
 ## 设计边界
 
@@ -19,7 +20,8 @@
 - 不依赖文件系统监控、线程库、容器库
 - 上层负责提供已经切好的视频访问单元和音频帧
 - 上层负责提供 `PTS/DTS`，单位固定为 `90kHz`
-- 可通过回调获知 `.ts` 和 `m3u8` 已更新，便于上层执行上传/分发
+- 默认输出保存在内存里，通过回调通知上层取用并上传/分发
+- 仅在 `debug_write_files = 1` 时才会落盘到 `output_dir`
 
 ## 核心接口
 
@@ -31,17 +33,30 @@
 2. 连续调用 `hls_muxer_input_video()` / `hls_muxer_input_audio()`
 3. `hls_muxer_close()`
 
-如需在文件更新后通知上层，可在 `hls_muxer_config_t` 中填写：
+如需让上层在内容更新后立刻取用，可在 `hls_muxer_config_t` 中填写：
 
+- `debug_write_files`
 - `on_event`
 - `event_opaque`
 
 当前会触发两类事件：
 
-- `HLS_MUXER_EVENT_SEGMENT_READY`：一个 `.ts` 已经关闭并可读取
+- `HLS_MUXER_EVENT_SEGMENT_READY`：一个 `.ts` 已经生成完毕
 - `HLS_MUXER_EVENT_PLAYLIST_UPDATED`：`m3u8` 已重写完成
 
+事件回调里会直接带上：
+
+- `name`
+- `data`
+- `size`
+- `sequence`
+
 触发顺序是先 `.ts`，后 `m3u8`，这样上层在收到 playlist 更新通知时，相关 segment 已可上传。
+
+如果设置了 `debug_write_files = 1`：
+
+- `segment` 会额外写到 `output_dir/<name>`
+- `playlist` 会额外写到 `output_dir/<playlist_name>`
 
 ## 视频切片策略
 
@@ -113,7 +128,7 @@ ctest --test-dir build --output-on-failure
 ./build/demo input_video.au input_audio.aac out
 ```
 
-示例程序只是演示 API 调用方式，不是完整生产级喂流器。
+示例程序为了便于本地查看结果，显式开启了 `debug_write_files = 1`。生产接入时，如果你只想把内存中的 `.ts` / `m3u8` 上传给别的系统，不需要打开这个选项。
 
 ## 建议的上层接入方式
 

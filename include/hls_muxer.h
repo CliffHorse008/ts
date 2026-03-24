@@ -44,9 +44,16 @@ typedef enum {
     HLS_MUXER_EVENT_PLAYLIST_UPDATED = 1
 } hls_muxer_event_type_t;
 
+typedef struct {
+    hls_muxer_event_type_t type;
+    const char *name;
+    const uint8_t *data;
+    size_t size;
+    uint32_t sequence;
+} hls_muxer_event_t;
+
 typedef void (*hls_muxer_event_cb)(void *opaque,
-                                   hls_muxer_event_type_t event,
-                                   const char *path);
+                                   const hls_muxer_event_t *event);
 
 typedef struct {
     const char *output_dir;
@@ -56,6 +63,7 @@ typedef struct {
     uint32_t playlist_length;
     hls_video_codec_t video_codec;
     hls_audio_codec_t audio_codec;
+    int debug_write_files;
     hls_muxer_event_cb on_event;
     void *event_opaque;
 } hls_muxer_config_t;
