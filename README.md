@@ -22,6 +22,52 @@
 - 上层负责提供 `PTS/DTS`，单位固定为 `90kHz`
 - 默认输出保存在内存里，通过回调通知上层取用并上传/分发
 - 仅在 `debug_write_files = 1` 时才会落盘到 `output_dir`
+- 如果启用了视频，复用器会等到第一个关键帧后才真正开始输出；首个关键帧之前收到的非关键视频帧和音频帧都会被丢弃
+
+## 内存占用
+
+当前实现里，单个 `hls_muxer` 实例的总内存可近似写成：
+
+```text
+M_total = M_fixed + C_seg_cur + C_seg_ready + C_m3u8
+```
+
+其中：
+
+- `M_fixed`：`hls_muxer_t` 本身的固定开销，当前实现约 `6104 bytes`
+- `C_seg_cur`：当前正在生成的 `.ts` buffer 容量
+- `C_seg_ready`：上一个已完成、正等待上层取用的 `.ts` buffer 容量
+- `C_m3u8`：当前 `m3u8` 文本 buffer 容量
+
+动态 buffer 采用从 `1024` 字节开始、按 `2` 倍扩容的策略，因此：
+
+```text
+Cap(x) = 0                         , x = 0
+Cap(x) = next_pow2(max(1024, x))   , x > 0
+```
+
+所以更准确的公式是：
+
+```text
+M_total = 6104 + Cap(S_cur) + Cap(S_ready) + Cap(P)
+```
+
+- `S_cur`：当前 segment 实际字节数
+- `S_ready`：上一个 ready segment 实际字节数
+- `P`：当前 playlist 实际字节数
+
+峰值通常可近似估为：
+
+```text
+M_peak <= 6104 + 2 * Cap(S_ts_max) + Cap(P_max)
+```
+
+其中：
+
+- `S_ts_max`：系统中单个 `.ts` 的最大可能大小
+- `P_max`：最大 `m3u8` 文本大小
+
+实际工程里，`m3u8` 往往只有几百字节到几 KB，内存大头通常是两个 `.ts` buffer。
 
 ## 核心接口
 
@@ -60,6 +106,7 @@
 
 ## 视频切片策略
 
+- 如果存在视频流，首个 segment 会从第一个关键帧开始
 - 当收到关键帧且当前分片时长达到 `target_duration_sec` 时切片
 - H.264 关键帧检测：NAL type `5`
 - H.265 关键帧检测：IRAP NAL type `16..21`
@@ -102,26 +149,6 @@ ctest --test-dir build --output-on-failure
 
 当前包含一个集成测试：使用仓库内硬编码的 H.264 IDR AU 和 AAC ADTS 帧，验证 `m3u8` 与 `.ts` 分片是否按预期生成。
 
-## H.265 + AAC 一键验证
-
-仓库内保存了一份本地生成的样本：
-
-- `testdata/h265_aac/sample_h265.hevc`
-- `testdata/h265_aac/sample_aac.aac`
-
-一键执行验证：
-
-```sh
-./scripts/verify_saved_h265_aac.sh
-```
-
-这个命令会：
-
-- 构建 `offline_mux`
-- 用保存好的 H.265 Annex-B 和 AAC ADTS 样本生成 HLS
-- 用 `ffprobe` 检查 `m3u8`
-- 用 `ffmpeg` 完整解复用和解码，确认输出有效
-
 ## 示例
 
 ```sh
@@ -129,6 +156,10 @@ ctest --test-dir build --output-on-failure
 ```
 
 示例程序为了便于本地查看结果，显式开启了 `debug_write_files = 1`。生产接入时，如果你只想把内存中的 `.ts` / `m3u8` 上传给别的系统，不需要打开这个选项。
+
+需要注意，`demo` 只是最小 API 演示：它会把传入的整块视频 buffer 和整块音频 buffer 各重复喂 10 次，并用固定的 `2s` 时间戳步进推进，不是按真实 AU/音频帧节奏喂流。因此它适合做接口冒烟，不适合拿来判断真实帧率、切片节奏或播放流畅性。
+
+如果要更贴近真实输入，优先使用 `offline_mux`，按实际文件中的访问单元/音频帧顺序喂给复用器。
 
 ## 建议的上层接入方式
 
