@@ -26,6 +26,18 @@ typedef struct {
     size_t count;
 } event_log_t;
 
+typedef struct {
+    int started_streaming;
+    int has_open_segment;
+    int got_first_pts;
+    uint32_t next_segment_sequence;
+    uint64_t first_pts90k;
+    uint64_t last_pts90k;
+    uint64_t segment_start_pts90k;
+    uint64_t current_segment_max_pts90k;
+    uint64_t current_segment_duration90k;
+} expected_stats_t;
+
 static void build_test_h264_idr_au(uint8_t *buf, size_t size)
 {
     static const uint8_t prefix[] = {
@@ -283,6 +295,150 @@ static int event_log_matches(const event_log_t *log, const char *output_dir)
     return 1;
 }
 
+static int check_stats(const char *label,
+                       hls_muxer_t *muxer,
+                       const expected_stats_t *expected)
+{
+    hls_muxer_stats_t stats;
+
+    if (expected == NULL) {
+        fprintf(stderr, "missing expected stats for %s\n", label);
+        return 0;
+    }
+
+    if (hls_muxer_get_stats(muxer, &stats) != HLS_OK) {
+        fprintf(stderr, "hls_muxer_get_stats failed for %s\n", label);
+        return 0;
+    }
+
+    if (stats.started_streaming != expected->started_streaming ||
+        stats.has_open_segment != expected->has_open_segment ||
+        stats.got_first_pts != expected->got_first_pts ||
+        stats.next_segment_sequence != expected->next_segment_sequence ||
+        stats.first_pts90k != expected->first_pts90k ||
+        stats.last_pts90k != expected->last_pts90k ||
+        stats.segment_start_pts90k != expected->segment_start_pts90k ||
+        stats.current_segment_max_pts90k != expected->current_segment_max_pts90k ||
+        stats.current_segment_duration90k != expected->current_segment_duration90k) {
+        fprintf(stderr,
+                "unexpected stats for %s: started=%d open=%d first=%d next_seq=%u "
+                "first_pts=%llu last_pts=%llu seg_start=%llu seg_max=%llu seg_dur=%llu\n",
+                label,
+                stats.started_streaming,
+                stats.has_open_segment,
+                stats.got_first_pts,
+                (unsigned int)stats.next_segment_sequence,
+                (unsigned long long)stats.first_pts90k,
+                (unsigned long long)stats.last_pts90k,
+                (unsigned long long)stats.segment_start_pts90k,
+                (unsigned long long)stats.current_segment_max_pts90k,
+                (unsigned long long)stats.current_segment_duration90k);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int run_muxer_stats_query_test(const char *output_dir)
+{
+    hls_muxer_t *muxer = NULL;
+    hls_muxer_config_t cfg;
+    hls_muxer_stats_t stats;
+    uint8_t h264_idr_au[TEST_H264_AU_SIZE];
+    uint8_t aac_adts_frame[TEST_AAC_FRAME_SIZE];
+
+    static const expected_stats_t expected_open = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+    static const expected_stats_t expected_first_video = {
+        1, 1, 1, 0, 0, 0, 0, 0, 0
+    };
+    static const expected_stats_t expected_audio_advanced = {
+        1, 1, 1, 0, 0, 90000, 0, 90000, 90000
+    };
+    static const expected_stats_t expected_after_rotate = {
+        1, 1, 1, 1, 0, 180000, 180000, 180000, 0
+    };
+
+    build_test_h264_idr_au(h264_idr_au, sizeof(h264_idr_au));
+    build_test_aac_adts_frame(aac_adts_frame, sizeof(aac_adts_frame));
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.output_dir = output_dir;
+    cfg.playlist_name = "live.m3u8";
+    cfg.segment_prefix = "seg_";
+    cfg.target_duration_sec = 2;
+    cfg.playlist_length = 6;
+    cfg.video_codec = HLS_VIDEO_CODEC_H264;
+    cfg.audio_codec = HLS_AUDIO_CODEC_AAC;
+    cfg.debug_write_files = 0;
+
+    if (hls_muxer_get_stats(NULL, &stats) != HLS_ERR_ARG ||
+        hls_muxer_get_stats((hls_muxer_t *)&cfg, NULL) != HLS_ERR_ARG) {
+        fprintf(stderr, "hls_muxer_get_stats argument validation failed\n");
+        return 1;
+    }
+
+    if (hls_muxer_open(&muxer, &cfg) != HLS_OK) {
+        fprintf(stderr, "hls_muxer_open failed in stats query test\n");
+        return 1;
+    }
+
+    if (!check_stats("open", muxer, &expected_open)) {
+        hls_muxer_close(muxer, 0);
+        return 1;
+    }
+
+    if (hls_muxer_input_video(muxer,
+                              h264_idr_au,
+                              sizeof(h264_idr_au),
+                              0,
+                              0,
+                              1) != HLS_OK) {
+        fprintf(stderr, "hls_muxer_input_video failed in stats query test\n");
+        hls_muxer_close(muxer, 0);
+        return 1;
+    }
+
+    if (!check_stats("first_video", muxer, &expected_first_video)) {
+        hls_muxer_close(muxer, 0);
+        return 1;
+    }
+
+    if (hls_muxer_input_audio(muxer,
+                              aac_adts_frame,
+                              sizeof(aac_adts_frame),
+                              90000) != HLS_OK) {
+        fprintf(stderr, "hls_muxer_input_audio failed in stats query test\n");
+        hls_muxer_close(muxer, 0);
+        return 1;
+    }
+
+    if (!check_stats("audio_advanced", muxer, &expected_audio_advanced)) {
+        hls_muxer_close(muxer, 0);
+        return 1;
+    }
+
+    if (hls_muxer_input_video(muxer,
+                              h264_idr_au,
+                              sizeof(h264_idr_au),
+                              180000,
+                              180000,
+                              1) != HLS_OK) {
+        fprintf(stderr, "second hls_muxer_input_video failed in stats query test\n");
+        hls_muxer_close(muxer, 0);
+        return 1;
+    }
+
+    if (!check_stats("after_rotate", muxer, &expected_after_rotate)) {
+        hls_muxer_close(muxer, 0);
+        return 1;
+    }
+
+    hls_muxer_close(muxer, 1);
+    return 0;
+}
+
 static int run_muxer_smoke_test(const char *output_dir)
 {
     char playlist_path[512];
@@ -400,6 +556,10 @@ int main(int argc, char **argv)
 {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <output_dir>\n", argv[0]);
+        return 1;
+    }
+
+    if (run_muxer_stats_query_test(argv[1]) != 0) {
         return 1;
     }
 

@@ -1021,6 +1021,31 @@ void hls_muxer_close(hls_muxer_t *muxer, int end_list)
     free(muxer);
 }
 
+hls_result_t hls_muxer_get_stats(const hls_muxer_t *muxer, hls_muxer_stats_t *stats)
+{
+    if (muxer == NULL || stats == NULL) {
+        return HLS_ERR_ARG;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    stats->started_streaming = muxer->started_streaming;
+    stats->has_open_segment = muxer->has_open_segment;
+    stats->got_first_pts = muxer->got_first_pts;
+    stats->next_segment_sequence = muxer->segment_sequence;
+    stats->first_pts90k = muxer->first_pts90k;
+    stats->last_pts90k = muxer->last_pts90k;
+    stats->segment_start_pts90k = muxer->segment_start_pts90k;
+    stats->current_segment_max_pts90k = muxer->current_segment_max_pts90k;
+
+    if (muxer->has_open_segment &&
+        muxer->current_segment_max_pts90k >= muxer->segment_start_pts90k) {
+        stats->current_segment_duration90k =
+            muxer->current_segment_max_pts90k - muxer->segment_start_pts90k;
+    }
+
+    return HLS_OK;
+}
+
 hls_result_t hls_muxer_input_video(hls_muxer_t *m,
                                    const uint8_t *data,
                                    size_t size,

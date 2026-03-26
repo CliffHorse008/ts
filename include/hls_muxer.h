@@ -52,6 +52,18 @@ typedef struct {
     uint32_t sequence;
 } hls_muxer_event_t;
 
+typedef struct {
+    int started_streaming;
+    int has_open_segment;
+    int got_first_pts;
+    uint32_t next_segment_sequence;
+    uint64_t first_pts90k;
+    uint64_t last_pts90k;
+    uint64_t segment_start_pts90k;
+    uint64_t current_segment_max_pts90k;
+    uint64_t current_segment_duration90k;
+} hls_muxer_stats_t;
+
 typedef void (*hls_muxer_event_cb)(void *opaque,
                                    const hls_muxer_event_t *event);
 
@@ -72,6 +84,7 @@ typedef struct hls_muxer hls_muxer_t;
 
 hls_result_t hls_muxer_open(hls_muxer_t **muxer, const hls_muxer_config_t *config);
 void hls_muxer_close(hls_muxer_t *muxer, int end_list);
+hls_result_t hls_muxer_get_stats(const hls_muxer_t *muxer, hls_muxer_stats_t *stats);
 
 hls_result_t hls_muxer_input_video(hls_muxer_t *muxer,
                                    const uint8_t *data,

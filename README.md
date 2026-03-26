@@ -79,6 +79,17 @@ M_peak <= 6104 + 2 * Cap(S_ts_max) + Cap(P_max)
 2. 连续调用 `hls_muxer_input_video()` / `hls_muxer_input_audio()`
 3. `hls_muxer_close()`
 
+如需显式查询当前时间线和分片状态，可调用 `hls_muxer_get_stats()`，它会返回：
+
+- `first_pts90k`：整个 muxer 真正开始输出后的首个 PTS
+- `segment_start_pts90k`：当前打开中的 segment 起点
+- `current_segment_max_pts90k`：当前 segment 内已写入样本的最大 PTS
+- `current_segment_duration90k`：当前 segment 已累计的时长
+- `last_pts90k`：最近一次成功写入的样本 PTS
+- `next_segment_sequence`：当前打开中的 segment 序号；如果当前没有打开的 segment，则表示下一个将使用的序号
+
+这个接口返回的是“当前状态快照”，适合应用层做监控、日志和调试。单位固定为 `90kHz`。
+
 如需让上层在内容更新后立刻取用，可在 `hls_muxer_config_t` 中填写：
 
 - `debug_write_files`
