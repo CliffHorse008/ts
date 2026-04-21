@@ -50,6 +50,7 @@ typedef struct {
     const uint8_t *data;
     size_t size;
     uint32_t sequence;
+    uint32_t segment_count;
 } hls_muxer_event_t;
 
 typedef struct {

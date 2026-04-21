@@ -107,6 +107,12 @@ M_peak <= 6104 + 2 * Cap(S_ts_max) + Cap(P_max)
 - `data`
 - `size`
 - `sequence`
+- `segment_count`
+
+其中：
+
+- 对 `HLS_MUXER_EVENT_PLAYLIST_UPDATED`，`segment_count == 0` 表示当前是空 playlist
+- `hls_muxer_open()` 时会立即触发一次 playlist 更新事件，此时通常 `segment_count == 0`
 
 触发顺序是先 `.ts`，后 `m3u8`，这样上层在收到 playlist 更新通知时，相关 segment 已可上传。
 

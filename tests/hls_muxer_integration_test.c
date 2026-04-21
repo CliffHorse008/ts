@@ -19,6 +19,7 @@ typedef struct {
     hls_muxer_event_type_t event;
     char name[512];
     size_t size;
+    uint32_t segment_count;
 } event_record_t;
 
 typedef struct {
@@ -245,6 +246,7 @@ static void test_event_cb(void *opaque,
 
     log->items[log->count].event = event->type;
     log->items[log->count].size = event->size;
+    log->items[log->count].segment_count = event->segment_count;
     snprintf(log->items[log->count].name, sizeof(log->items[log->count].name), "%s", event->name);
     log->count += 1;
 }
@@ -267,7 +269,8 @@ static int event_log_matches(const event_log_t *log, const char *output_dir)
 
     if (log->items[0].event != HLS_MUXER_EVENT_PLAYLIST_UPDATED ||
         strcmp(log->items[0].name, "live.m3u8") != 0 ||
-        log->items[0].size == 0) {
+        log->items[0].size == 0 ||
+        log->items[0].segment_count != 0) {
         fprintf(stderr, "unexpected initial playlist event\n");
         return 0;
     }
@@ -279,14 +282,16 @@ static int event_log_matches(const event_log_t *log, const char *output_dir)
 
         if (log->items[1 + i * 2].event != HLS_MUXER_EVENT_SEGMENT_READY ||
             strcmp(log->items[1 + i * 2].name, segment_name) != 0 ||
-            log->items[1 + i * 2].size == 0) {
+            log->items[1 + i * 2].size == 0 ||
+            log->items[1 + i * 2].segment_count != i) {
             fprintf(stderr, "unexpected segment event at index %zu\n", 1 + i * 2);
             return 0;
         }
 
         if (log->items[2 + i * 2].event != HLS_MUXER_EVENT_PLAYLIST_UPDATED ||
             strcmp(log->items[2 + i * 2].name, "live.m3u8") != 0 ||
-            log->items[2 + i * 2].size == 0) {
+            log->items[2 + i * 2].size == 0 ||
+            log->items[2 + i * 2].segment_count != i + 1) {
             fprintf(stderr, "unexpected playlist event at index %zu\n", 2 + i * 2);
             return 0;
         }

@@ -351,6 +351,7 @@ static void hls_notify_event(hls_muxer_t *m,
         evt.data = data;
         evt.size = size;
         evt.sequence = sequence;
+        evt.segment_count = m->segment_count;
         m->cfg.on_event(m->cfg.event_opaque, &evt);
     }
 }
